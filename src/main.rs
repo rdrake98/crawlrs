@@ -1,4 +1,5 @@
 #![feature(conservative_impl_trait)]
+#![feature(field_init_shorthand)]
 
 extern crate hyper;
 extern crate tokio_core;
@@ -67,24 +68,29 @@ fn run() -> Result<()> {
 
     let mut seen_urls = HashMap::new();
 
-    let handler = rx.for_each(move |(page_url, links)| {
+    let handler = rx.for_each(move |outcome| {
         let mut linkurls = Vec::new();
-        let mut linkerrs = Vec::new();
-        for link in links {
+        for link in outcome.links {
             match hyper::Url::parse(&link) {
                 Ok(url) => linkurls.push(url),
-                Err(_) => linkerrs.push(link)
+                Err(_) => {
+                    let fixedurl = outcome.url.clone().join(&link).unwrap();
+                    println!("Exapanded {} to {}", link, fixedurl);
+                    linkurls.push(fixedurl);
+                }
             }
         }
-        for urlstr in linkerrs {
-            println!("Could not parse {}", urlstr)
+        for link in &linkurls {
+            if link.as_str().ends_with(".js") {
+                println!("js found: {}", link)
+            }
         }
         let nlinks = linkurls.len();
-        seen_urls.insert(page_url.clone(), linkurls.clone());
+        seen_urls.insert(outcome.url.clone(), linkurls.clone());
         let mut newlinks: Vec<_> = linkurls.into_iter().filter(|key| !seen_urls.contains_key(key)).collect();
         newlinks.sort();
         newlinks.dedup();
-        println!("Found {} links in {}, of which {} are newnique", nlinks, page_url, newlinks.len() );
+        println!("Found {} links in {}, of which {} are newnique", nlinks, outcome.url, newlinks.len() );
         start_worker(&handle, &tx, &client, newlinks);
         ok(())
     });
@@ -94,47 +100,29 @@ fn run() -> Result<()> {
 }
 
 fn start_worker(handle: &reactor::Handle,
-                tx: &mpsc::Sender<(Url, Vec<String>)>,
+                tx: &mpsc::Sender<ParseOutcome>,
                 client: &HttpClient,
                 links: Vec<Url>) {
     for url in links {
         if REQUESTCT.load(Ordering::Relaxed) > maxreq() { return }
         match url.scheme() {
             "https" => {
-                // skip for now
+                // skip for now, hopefully soon won't be necessary
                 println!("Skipping HTTPS: {}", url);
                 continue
             },
             "http" => (),
             _rest => {
-                println!("Skipping umrecognized: {}", url);
+                println!("Skipping url {} (unrecognized scheme)", url);
                 continue
             }
         };
         let tx = tx.clone();
-        let worker = fetch_html(&client, url.clone())
-            .then(|res| {
-                match res {
-                    Ok((s @ StatusCode::Ok, body))
-                    | Ok((s @ StatusCode::Found, body))
-                    | Ok((s @ StatusCode::MovedPermanently, body)) => {
-                        println!("Status: {} for {}", s, url);
-                        process_html(&body)
-                            .map(|links| (url, links))
-                            .into_future()
-                    },
-                    Ok((status, _)) => err(format!(
-                            "Bad status code {} for {}", status, url).into()),
-                    Err(e) => err(format!(
-                                "Worker error: {} for {}", e, url).into())
-                }
-            })
-            .and_then(|(url, links)| tx.send((url, links))
+        let worker = fetch_html(&client, url)
+            .and_then(|outcome| tx.send(outcome)
                       .map_err(|e| format!("{}", e).into()))
             .then(|res| {
-                if let Err(e) = res {
-                    log_error(e)
-                };
+                if let Err(e) = res { log_error(e) };
                 ok(())
             });
         let rq = REQUESTCT.load(Ordering::Relaxed);
@@ -147,24 +135,38 @@ fn start_worker(handle: &reactor::Handle,
 }
 
 
-fn fetch_html(client: &HttpClient, url: Url) -> impl Future<Item=(StatusCode, Vec<u8>), Error=hyper::Error> {
+fn fetch_html(client: &HttpClient, url: Url) ->
+    impl Future<Item=ParseOutcome, Error=Error>
+{
     println!("Fetching URL: {}", url);
     client.clone()
-        .get(url)
+        .get(url.clone())
         .and_then(|res| {
-
             let status = *res.status();
-
             let bodybuf = {
                 let headers = res.headers();
                 let buflen = headers.get::<hyper::header::ContentLength>();
                 Vec::with_capacity(buflen.map(|b| b.0 as usize).unwrap_or(1024))
             };
-
             res.body().fold(bodybuf, |mut bodybuf, chunk| {
                 bodybuf.extend_from_slice(&*chunk);
                 ok::<_, hyper::Error>(bodybuf)
             }).map(move |b| (status, b))
+        })
+        .then(|res| {
+            match res {
+                Ok((s @ StatusCode::Ok, body))
+                    | Ok((s @ StatusCode::Found, body))
+                    | Ok((s @ StatusCode::MovedPermanently, body)) => {
+                        process_html(&body)
+                            .map(|links| ParseOutcome::new(url, s, links))
+                            .into_future()
+                    },
+                Ok((status, _)) => err(format!(
+                    "Bad status code {} for {}", status, url).into()),
+                Err(e) => err(format!(
+                    "Worker error: {} for {}", e, url).into())
+            }
         })
 }
 
@@ -233,10 +235,14 @@ fn log_error(e: Error) {
     }
 }
 
-
 struct ParseOutcome {
-    url: Url,
-    status: StatusCode,
-    links: Vec<String>
+    pub url: Url,
+    pub status: StatusCode,
+    pub links: Vec<String>
 }
 
+impl ParseOutcome {
+    fn new(url: Url, status: StatusCode, links: Vec<String>) -> ParseOutcome {
+        ParseOutcome { url, status, links }
+    }
+}
