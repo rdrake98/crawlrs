@@ -9,7 +9,6 @@ extern crate html5ever;
 #[macro_use]
 extern crate error_chain;
 
-
 mod errors {
     error_chain!{}
 }
@@ -20,11 +19,9 @@ use hyper::client::{Client, HttpConnector};
 use hyper::status::StatusCode;
 use hyper::Url;
 
-use futures::Future;
+use futures::{Future, Sink, IntoFuture, Stream};
 use futures::future::{ok, err};
 use futures::sync::mpsc;
-use futures::Sink;
-use futures::stream::Stream;
 
 use tokio_core::reactor;
 
@@ -33,14 +30,31 @@ use html5ever::rcdom::{self, RcDom};
 use html5ever::Attribute;
 use html5ever::tendril::TendrilSink;
 
-use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, ATOMIC_USIZE_INIT, Ordering};
+use std::collections::HashMap;
 
 type HttpClient = Client<HttpConnector>;
 
 quick_main!(run);
 
+static REQUESTCT: AtomicUsize = ATOMIC_USIZE_INIT;
+static mut MAXREQ: usize = 0;
+
+fn maxreq() -> usize {
+    unsafe { MAXREQ }
+}
+
+fn set_maxreq(v: usize) {
+    unsafe { MAXREQ = v }
+}
+
 fn run() -> Result<()> {
     let root = std::env::args().nth(1).ok_or(ErrorKind::Msg(String::from("No URL provided")))?;
+    set_maxreq(std::env::args()
+        .nth(2)
+        .map(|s| s.parse::<usize>().chain_err(|| "Failed to parse"))
+        .unwrap_or(Ok(10))?);
+
     let root = hyper::Url::parse(&root).chain_err(|| "Url failed to parse")?;
     let mut core = reactor::Core::new().chain_err(|| "Failed to open reactor")?;
     let handle = core.handle();
@@ -51,19 +65,27 @@ fn run() -> Result<()> {
     // get root
     start_worker(&handle, &tx, &client, vec![root]);
 
-    let mut ct = 0;
+    let mut seen_urls = HashMap::new();
 
     let handler = rx.for_each(move |(page_url, links)| {
-        let linkurls = links.iter().filter_map(|link| {
-            hyper::Url::parse(&link).ok()
-        }).collect::<Vec<_>>();
-
-        ct += 1;
-        println!("Found {} links in {}", linkurls.len(), page_url );
-        println!("COUNT: {}", ct);
-        if ct < 5 {
-            start_worker(&handle, &tx, &client, linkurls);
+        let mut linkurls = Vec::new();
+        let mut linkerrs = Vec::new();
+        for link in links {
+            match hyper::Url::parse(&link) {
+                Ok(url) => linkurls.push(url),
+                Err(_) => linkerrs.push(link)
+            }
         }
+        for urlstr in linkerrs {
+            println!("Could not parse {}", urlstr)
+        }
+        let nlinks = linkurls.len();
+        seen_urls.insert(page_url.clone(), linkurls.clone());
+        let mut newlinks: Vec<_> = linkurls.into_iter().filter(|key| !seen_urls.contains_key(key)).collect();
+        newlinks.sort();
+        newlinks.dedup();
+        println!("Found {} links in {}, of which {} are newnique", nlinks, page_url, newlinks.len() );
+        start_worker(&handle, &tx, &client, newlinks);
         ok(())
     });
 
@@ -76,24 +98,51 @@ fn start_worker(handle: &reactor::Handle,
                 client: &HttpClient,
                 links: Vec<Url>) {
     for url in links {
+        if REQUESTCT.load(Ordering::Relaxed) > maxreq() { return }
+        match url.scheme() {
+            "https" => {
+                // skip for now
+                println!("Skipping HTTPS: {}", url);
+                continue
+            },
+            "http" => (),
+            _rest => {
+                println!("Skipping umrecognized: {}", url);
+                continue
+            }
+        };
         let tx = tx.clone();
         let worker = fetch_html(&client, url.clone())
             .then(|res| {
                 match res {
-                    Ok((StatusCode::Ok, body)) => ok((url, process_html(&body))),
-                    Ok((status, _)) => {
-                        println!("Bad status code {} for {}", status, url);
-                        err(())
+                    Ok((s @ StatusCode::Ok, body))
+                    | Ok((s @ StatusCode::Found, body))
+                    | Ok((s @ StatusCode::MovedPermanently, body)) => {
+                        println!("Status: {} for {}", s, url);
+                        process_html(&body)
+                            .map(|links| (url, links))
+                            .into_future()
                     },
-                    Err(e) => {
-                        println!("Worker error: {} for {}", e, url);
-                        err(())
-                    }
+                    Ok((status, _)) => err(format!(
+                            "Bad status code {} for {}", status, url).into()),
+                    Err(e) => err(format!(
+                                "Worker error: {} for {}", e, url).into())
                 }
             })
             .and_then(|(url, links)| tx.send((url, links))
-                      .then(|_| ok(())));
-        handle.spawn(worker);
+                      .map_err(|e| format!("{}", e).into()))
+            .then(|res| {
+                if let Err(e) = res {
+                    log_error(e)
+                };
+                ok(())
+            });
+        let rq = REQUESTCT.load(Ordering::Relaxed);
+        if rq < maxreq() {
+            println!("Spawning {}th worker", rq);
+            handle.spawn(worker);
+        };
+        REQUESTCT.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -119,16 +168,16 @@ fn fetch_html(client: &HttpClient, url: Url) -> impl Future<Item=(StatusCode, Ve
         })
 }
 
-fn process_html(source: &[u8]) -> Vec<String> {
-    let dom = parse_html(source);
-    find_links(&dom)
+fn process_html(source: &[u8]) -> Result<Vec<String>> {
+    let dom = parse_html(source)?;
+    Ok(find_links(&dom))
 }
 
-fn parse_html(mut source: &[u8]) -> RcDom {
+fn parse_html(mut source: &[u8]) -> Result<RcDom> {
     parse_document(RcDom::default(), Default::default())
         .from_utf8()
         .read_from(&mut source)
-        .unwrap()
+        .chain_err(|| "HTML parse failed")
 }
 
 
@@ -164,3 +213,30 @@ fn get_url(attrs: &[Attribute]) -> Option<&str> {
     }
     return None
 }
+
+fn log_error(e: Error) {
+    // taken from https://github.com/brson/error-chain/blob/master/examples/quickstart.rs
+    use ::std::io::Write;
+    let stderr = &mut ::std::io::stderr();
+    let errmsg = "Error writing to stderr";
+
+    writeln!(stderr, "error: {}", e).expect(errmsg);
+
+    for e in e.iter().skip(1) {
+        writeln!(stderr, "caused by: {}", e).expect(errmsg);
+    }
+
+    // The backtrace is not always generated. Try to run this example
+    // with `RUST_BACKTRACE=1`.
+    if let Some(backtrace) = e.backtrace() {
+        writeln!(stderr, "backtrace: {:?}", backtrace).expect(errmsg);
+    }
+}
+
+
+struct ParseOutcome {
+    url: Url,
+    status: StatusCode,
+    links: Vec<String>
+}
+
