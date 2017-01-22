@@ -27,7 +27,7 @@ use futures::sync::mpsc;
 use tokio_core::reactor;
 
 use html5ever::parse_document;
-use html5ever::rcdom::{self, RcDom};
+use html5ever::rcdom::{self, RcDom, ElementEnum};
 use html5ever::Attribute;
 use html5ever::tendril::TendrilSink;
 
@@ -80,16 +80,24 @@ fn run() -> Result<()> {
                 }
             }
         }
-        for link in &linkurls {
-            if link.as_str().ends_with(".js") {
-                println!("js found: {}", link)
-            }
-        }
         let nlinks = linkurls.len();
         seen_urls.insert(outcome.url.clone(), linkurls.clone());
         let mut newlinks: Vec<_> = linkurls.into_iter().filter(|key| !seen_urls.contains_key(key)).collect();
         newlinks.sort();
         newlinks.dedup();
+        let mut newlinks: Vec<_> = newlinks.into_iter().filter(|link| {
+            if link.as_str().ends_with(".js") {
+                println!("Seen js: {}", link);
+                seen_urls.insert(link.clone(), vec![]);
+                false
+            } else {
+                true
+            }
+        }).collect();
+        for link in &newlinks {
+            if link.as_str().ends_with(".js") {
+            }
+        }
         println!("Found {} links in {}, of which {} are newnique", nlinks, outcome.url, newlinks.len() );
         start_worker(&handle, &tx, &client, newlinks);
         ok(())
@@ -193,11 +201,16 @@ fn walk(handle: &rcdom::Handle, depth: usize, links: &mut Vec<String>) {
     use html5ever::rcdom::NodeEnum::*;
     let node = handle.borrow();
     match node.node {
-        Element(ref name ,_, ref attrs) => {
+        Element(ref name, ElementEnum::Normal, ref attrs) => {
             if &*name.local == "a" {
                 if let Some(url) = get_url(attrs) {
                     links.push(String::from(url));
                 }
+            }
+        },
+        Element(ref name, ElementEnum::Script(_), ref attrs) => {
+            if let Some(url) = get_script_url(attrs) {
+                links.push(String::from(url))
             }
         },
         _ => {}
@@ -213,7 +226,16 @@ fn get_url(attrs: &[Attribute]) -> Option<&str> {
             return Some(&attr.value)
         }
     }
-    return None
+    None
+}
+
+fn  get_script_url(attrs: &[Attribute]) -> Option<&str> {
+    for attr in attrs {
+        if &*attr.name.local == "src" {
+            return Some(&attr.value)
+        }
+    }
+    None
 }
 
 fn log_error(e: Error) {
